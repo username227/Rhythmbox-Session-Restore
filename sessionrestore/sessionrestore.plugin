@@ -1,0 +1,8 @@
+[Plugin]
+Loader=python3
+Module=sessionrestore
+IAge=2
+Name=Session Restore
+Description=Save song, playlist and progress; restore without autoplay.
+Authors=username227
+Copyright=Copyright 2026
