@@ -291,6 +291,7 @@ class SessionRestore(GObject.Object, Peas.Activatable):
             self.pending_seek_uri = None
             self._clear_pending_status()
             self._release_mute()
+            self._restore_visible_source_activation()
         finally:
             self.correcting_first_play = False
         return GLib.SOURCE_REMOVE
@@ -496,6 +497,30 @@ class SessionRestore(GObject.Object, Peas.Activatable):
         except Exception:
             LOG.exception('Session Restore: unable to preselect restored entry; first-Play correction remains enabled')
 
+    def _restore_visible_source_activation(self):
+        """After resume, reconnect native double-click handling to the visible page.
+
+        Before initial Play, the player must select the saved playlist so that
+        Rhythmbox resumes the correct entry. The library view may remain visible.
+        Rhythmbox connects entry-activated only for the player's selected source,
+        so leaving that source on the hidden shuffle playlist makes Music rows
+        respond visually to double-clicks without starting playback.
+
+        Updating only the *selected* source after playback has started does not
+        change the current playing source, playlist, or active play order.
+        """
+        try:
+            visible = self.shell.props.selected_page
+            if visible is None or not isinstance(visible, RB.Source):
+                return
+            if self.player.get_playing_entry() is None:
+                return
+            self.player.set_selected_source(visible)
+            LOG.warning('Session Restore: restored track activation in visible source %s',
+                        visible.props.name)
+        except Exception:
+            LOG.exception('Session Restore: could not restore visible-source playback controls')
+
     def _finish_deferred_seek(self):
         # Called ONLY after the user presses Play and Rhythmbox identifies the
         # selected song. Never open or pause the stream ourselves.
@@ -525,6 +550,7 @@ class SessionRestore(GObject.Object, Peas.Activatable):
             self._clear_resume_banner()
             self._clear_pending_status()
             self._release_mute()
+            self._restore_visible_source_activation()
             self.current_uri = uri
             self.last_observed_position = self._playing_time()
             self.last_observed_at = time.monotonic()
@@ -542,6 +568,7 @@ class SessionRestore(GObject.Object, Peas.Activatable):
                 self._clear_resume_banner()
                 self._clear_pending_status()
                 self._release_mute()
+                self._restore_visible_source_activation()
                 self.checkpoint(force=True)
                 return GLib.SOURCE_REMOVE
             return GLib.SOURCE_CONTINUE
