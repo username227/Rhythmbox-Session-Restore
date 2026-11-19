@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from gi.repository import GObject, GLib, Gtk, Peas, RB, GdkPixbuf
+from gi.repository import GObject, Gio, GLib, Gtk, Peas, RB, GdkPixbuf
 
 LOG = logging.getLogger('rhythmbox-session-restore')
 STATE_DIR = Path(os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state'))) / 'rhythmbox-session-restore'
@@ -81,11 +81,23 @@ class SessionRestore(GObject.Object, Peas.Activatable):
         self.preview_art_generation = 0
         self.correcting_first_play = False
         self.first_play_correction_id = None
+        self._interop_app = None
+        self._interop_action = None
 
     def do_activate(self):
         self.shell = self.object
         self.player = self.shell.props.shell_player
         self.db = self.shell.props.db
+        # Optional synchronous hand-off.  Both shuffle plugins work without
+        # this action when Session Restore is disabled.
+        self._interop_app = Gio.Application.get_default()
+        if self._interop_app is not None:
+            if self._interop_app.lookup_action('session-restore-abandon-pending') is not None:
+                LOG.warning('Session Restore: interop action already registered')
+            else:
+                self._interop_action = Gio.SimpleAction.new('session-restore-abandon-pending', None)
+                self._interop_action.connect('activate', self._abandon_pending_for_external_playback)
+                self._interop_app.add_action(self._interop_action)
         self.saved = read_json(STATE_FILE)
         self._clear_pending_status()
         # Enabling the plugin mid-session must not hijack a song already playing.
@@ -123,6 +135,10 @@ class SessionRestore(GObject.Object, Peas.Activatable):
                     'recovering saved session' if self.restoring else 'monitoring playback')
 
     def do_deactivate(self):
+        if self._interop_app is not None and self._interop_action is not None:
+            self._interop_app.remove_action('session-restore-abandon-pending')
+            self._interop_action = None
+        self._interop_app = None
         # Undo the temporary silence if the plugin is disabled mid-restoration.
         self._clear_resume_banner()
         self._clear_pending_status()
@@ -237,6 +253,49 @@ class SessionRestore(GObject.Object, Peas.Activatable):
         self.last_good_snapshot = snapshot
         self.last_checkpoint_at = now
 
+    def _abandon_pending_for_external_playback(self, *_args):
+        """The user chose New Shuffle or Resume, not native Play-to-resume.
+
+        Clear *all* pending Session Restore timers, mute and UI state BEFORE
+        the shuffle calls play_entry().  This cannot change saved shuffle
+        bookmarks or interrupt an already running normal playback session.
+        """
+        if not (self.restoring or self.started_restore or self.awaiting_play or
+                self.seek_timer_id is not None or
+                self.first_play_correction_id is not None):
+            return
+        self._cancel_pending_restore()
+        for name in ('seek_timer_id', 'first_play_correction_id'):
+            source_id = getattr(self, name, None)
+            if source_id is not None:
+                try:
+                    GLib.source_remove(source_id)
+                except (TypeError, RuntimeError):
+                    pass
+            setattr(self, name, None)
+        self.awaiting_play = False
+        self.restoring = False
+        self.started_restore = False
+        self.correcting_first_play = False
+        self.pending_seek_uri = None
+        self.pending_seek_position = 0
+        self.seek_attempts = 0
+        self.preview_art_generation += 1
+        self.preview_art_widget = None
+        self._clear_pending_status()
+        self._clear_resume_banner()
+        self._release_mute()
+        # A stopped session may have a preview in RBHeader's Not Playing label.
+        # Do not leave it pretending to be an active resume prompt.
+        if self.native_header_label is not None:
+            try:
+                if self.player.get_playing_entry() is None:
+                    self.native_header_label.set_text('Not Playing')
+            except (RuntimeError, AttributeError):
+                pass
+            self.native_header_label = None
+        LOG.warning('Session Restore: abandoned pending restore for explicit shuffle action')
+
     def on_song_changed(self, _player, entry):
         if self.restoring:
             if not self.started_restore and entry is not None:
@@ -272,6 +331,13 @@ class SessionRestore(GObject.Object, Peas.Activatable):
             source = self._source_for_saved(self.saved)
             if entry is None or source is None:
                 raise RuntimeError('saved entry or playlist is no longer available')
+            # Safeguard for older shuffle builds: never redirect playback to
+            # a bookmarked song that the saved playlist no longer contains.
+            if ((self.saved.get('source') or {}).get('kind') == 'playlist' and
+                    not self._playlist_contains(source, self.pending_seek_uri)):
+                LOG.warning('Session Restore: saved song left playlist; cancelling stale correction')
+                self._abandon_pending_for_external_playback()
+                return GLib.SOURCE_REMOVE
             self.correcting_first_play = True
             # We are responding to the user's actual Play action, not starting
             # audio on startup. The mute is held until our seek is complete.
